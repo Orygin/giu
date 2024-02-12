@@ -4,64 +4,47 @@ import (
 	"image"
 	"image/color"
 	"runtime"
+	"time"
 
-	imgui "github.com/AllenDang/cimgui-go"
-	"golang.org/x/image/colornames"
+	"github.com/AllenDang/imgui-go"
+	"github.com/faiface/mainthread"
+	"github.com/go-gl/glfw/v3.3/glfw"
+	"gopkg.in/eapache/queue.v1"
 )
 
-// MasterWindowFlags implements BackendWindowFlags.
-type MasterWindowFlags int
+// MasterWindowFlags wraps imgui.GLFWWindowFlags.
+type MasterWindowFlags imgui.GLFWWindowFlags
 
 // master window flags.
 const (
 	// Specifies the window will be fixed size.
-	MasterWindowFlagsNotResizable MasterWindowFlags = 1 << iota
+	MasterWindowFlagsNotResizable MasterWindowFlags = MasterWindowFlags(imgui.GLFWWindowFlagsNotResizable)
 	// Specifies whether the window is maximized.
-	MasterWindowFlagsMaximized
+	MasterWindowFlagsMaximized MasterWindowFlags = MasterWindowFlags(imgui.GLFWWindowFlagsMaximized)
 	// Specifies whether the window will be always-on-top.
-	MasterWindowFlagsFloating
+	MasterWindowFlagsFloating MasterWindowFlags = MasterWindowFlags(imgui.GLFWWindowFlagsFloating)
 	// Specifies whether the window will be frameless.
-	MasterWindowFlagsFrameless
+	MasterWindowFlagsFrameless MasterWindowFlags = MasterWindowFlags(imgui.GLFWWindowFlagsFrameless)
 	// Specifies whether the window will be transparent.
-	MasterWindowFlagsTransparent
+	MasterWindowFlagsTransparent MasterWindowFlags = MasterWindowFlags(imgui.GLFWWindowFlagsTransparent)
 )
 
-// parseAndApply converts MasterWindowFlags to appropriate imgui.GLFWWindowFlags.
-func (m MasterWindowFlags) parseAndApply(b imgui.Backend[imgui.GLFWWindowFlags]) {
-	data := map[MasterWindowFlags]struct {
-		f     imgui.GLFWWindowFlags
-		value int // value isn't always true (sometimes false). Also WindowHint takes int not bool
-	}{
-		MasterWindowFlagsNotResizable: {imgui.GLFWWindowFlagsResizable, 0},
-		MasterWindowFlagsMaximized:    {imgui.GLFWWindowFlagsMaximized, 1},
-		MasterWindowFlagsFloating:     {imgui.GLFWWindowFlagsFloating, 1},
-		MasterWindowFlagsFrameless:    {imgui.GLFWWindowFlagsDecorated, 0},
-		MasterWindowFlagsTransparent:  {imgui.GLFWWindowFlagsTransparent, 1},
-	}
-
-	for flag, d := range data {
-		if m&flag != 0 {
-			b.SetWindowFlags(d.f, d.value)
-		}
-	}
-}
-
-// TODO(gucio321) implement this in cimgui-go
 // DontCare could be used as an argument to (*MasterWindow).SetSizeLimits.
-// var DontCare int = imgui.GlfwDontCare
+var DontCare int = imgui.GlfwDontCare
 
 // MasterWindow represents a glfw master window
 // It is a base for a windows (see Window.go).
 type MasterWindow struct {
-	backend imgui.Backend[imgui.GLFWWindowFlags]
-
 	width      int
 	height     int
-	clearColor imgui.Vec4
+	clearColor [4]float32
 	title      string
+	platform   imgui.Platform
+	renderer   imgui.Renderer
 	context    *imgui.Context
 	io         *imgui.IO
 	updateFunc func()
+	postUpdateFunc func()
 
 	// possibility to expend InputHandler's stuff
 	// See SetAdditionalInputHandler
@@ -72,54 +55,59 @@ type MasterWindow struct {
 // it should be called in main function. For more details and use cases,
 // see examples/helloworld/.
 func NewMasterWindow(title string, width, height int, flags MasterWindowFlags) *MasterWindow {
-	imGuiContext := imgui.CreateContext()
-	imgui.PlotCreateContext()
-	// imgui.ImNodesCreateContext() // TODO after implementing ImNodes in cimgui
+	context := imgui.CreateContext(nil)
+	imgui.ImPlotCreateContext()
+	imgui.ImNodesCreateContext()
 
 	io := imgui.CurrentIO()
 
-	// TODO: removed ConfigFlagEnablePowerSavingMode
-	io.SetConfigFlags(imgui.BackendFlagsRendererHasVtxOffset)
+	io.SetConfigFlags( imgui.BackendFlagsRendererHasVtxOffset)
 	io.SetBackendFlags(imgui.BackendFlagsRendererHasVtxOffset)
 
 	// Disable imgui.ini
 	io.SetIniFilename("")
 
-	backend := imgui.CreateBackend(imgui.NewGLFWBackend())
+	p, err := imgui.NewGLFW(io, title, width, height, imgui.GLFWWindowFlags(flags))
+	if err != nil {
+		panic(err)
+	}
 
-	// Create GIU context
-	Context = CreateContext(backend)
+	r, err := imgui.NewOpenGL3(io, 1.0)
+	if err != nil {
+		panic(err)
+	}
+
+	Context = CreateContext(p, r)
+
+	// init texture loading queue
+	Context.textureLoadingQueue = queue.New()
 
 	mw := &MasterWindow{
-		clearColor: imgui.Vec4{X: 0, Y: 0, Z: 0, W: 1},
+		clearColor: [4]float32{0, 0, 0, 1},
 		width:      width,
 		height:     height,
 		title:      title,
-		io:         io,
-		context:    imGuiContext,
-		backend:    backend,
+		io:         &io,
+		context:    context,
+		platform:   p,
+		renderer:   r,
 	}
-
-	backend.SetBeforeRenderHook(mw.beforeRender)
-	backend.SetAfterRenderHook(mw.afterRender)
-	backend.SetBeforeDestroyContextHook(mw.beforeDestroy)
-	flags.parseAndApply(backend)
-	backend.CreateWindow(title, width, height)
 
 	mw.SetInputHandler(newInputHandler())
 
-	mw.backend.SetSizeChangeCallback(mw.sizeChange)
+	p.SetSizeChangeCallback(mw.sizeChange)
 
-	mw.SetBgColor(colornames.Black)
+	mw.setTheme()
 
 	return mw
 }
 
-func (w *MasterWindow) setTheme() (fin func()) {
+func (w *MasterWindow) setTheme() {
+	style := imgui.CurrentStyle()
+
 	// Scale DPI in windows
 	if runtime.GOOS == "windows" {
-		xScale, _ := Context.backend.ContentScale()
-		imgui.CurrentStyle().ScaleAllSizes(xScale)
+		style.ScaleAllSizes(Context.GetPlatform().GetContentScale())
 	}
 
 	imgui.PushStyleVarFloat(imgui.StyleVarWindowRounding, 2)
@@ -127,134 +115,55 @@ func (w *MasterWindow) setTheme() (fin func()) {
 	imgui.PushStyleVarFloat(imgui.StyleVarGrabRounding, 4)
 	imgui.PushStyleVarFloat(imgui.StyleVarFrameBorderSize, 1)
 
-	imgui.PushStyleColorVec4(imgui.ColText, imgui.Vec4{X: 0.95, Y: 0.96, Z: 0.98, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTextDisabled, imgui.Vec4{X: 0.36, Y: 0.42, Z: 0.47, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColWindowBg, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColChildBg, imgui.Vec4{X: 0.15, Y: 0.18, Z: 0.22, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColPopupBg, imgui.Vec4{X: 0.08, Y: 0.08, Z: 0.08, W: 0.94})
-	imgui.PushStyleColorVec4(imgui.ColBorder, imgui.Vec4{X: 0.08, Y: 0.10, Z: 0.12, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColBorderShadow, imgui.Vec4{X: 0.00, Y: 0.00, Z: 0.00, W: 0.00})
-	imgui.PushStyleColorVec4(imgui.ColFrameBg, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColFrameBgHovered, imgui.Vec4{X: 0.12, Y: 0.20, Z: 0.28, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColFrameBgActive, imgui.Vec4{X: 0.09, Y: 0.12, Z: 0.14, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTitleBg, imgui.Vec4{X: 0.09, Y: 0.12, Z: 0.14, W: 0.65})
-	imgui.PushStyleColorVec4(imgui.ColTitleBgActive, imgui.Vec4{X: 0.08, Y: 0.10, Z: 0.12, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTitleBgCollapsed, imgui.Vec4{X: 0.00, Y: 0.00, Z: 0.00, W: 0.51})
-	imgui.PushStyleColorVec4(imgui.ColMenuBarBg, imgui.Vec4{X: 0.15, Y: 0.18, Z: 0.22, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColScrollbarBg, imgui.Vec4{X: 0.02, Y: 0.02, Z: 0.02, W: 0.39})
-	imgui.PushStyleColorVec4(imgui.ColScrollbarGrab, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColScrollbarGrabHovered, imgui.Vec4{X: 0.18, Y: 0.22, Z: 0.25, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColScrollbarGrabActive, imgui.Vec4{X: 0.09, Y: 0.21, Z: 0.31, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColCheckMark, imgui.Vec4{X: 0.28, Y: 0.56, Z: 1.00, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColSliderGrab, imgui.Vec4{X: 0.28, Y: 0.56, Z: 1.00, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColSliderGrabActive, imgui.Vec4{X: 0.37, Y: 0.61, Z: 1.00, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColButton, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColButtonHovered, imgui.Vec4{X: 0.28, Y: 0.56, Z: 1.00, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColButtonActive, imgui.Vec4{X: 0.06, Y: 0.53, Z: 0.98, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColHeader, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 0.55})
-	imgui.PushStyleColorVec4(imgui.ColHeaderHovered, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.80})
-	imgui.PushStyleColorVec4(imgui.ColHeaderActive, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColSeparator, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColSeparatorHovered, imgui.Vec4{X: 0.10, Y: 0.40, Z: 0.75, W: 0.78})
-	imgui.PushStyleColorVec4(imgui.ColSeparatorActive, imgui.Vec4{X: 0.10, Y: 0.40, Z: 0.75, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColResizeGrip, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.25})
-	imgui.PushStyleColorVec4(imgui.ColResizeGripHovered, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.67})
-	imgui.PushStyleColorVec4(imgui.ColResizeGripActive, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.95})
-	imgui.PushStyleColorVec4(imgui.ColTab, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTabHovered, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.80})
-	imgui.PushStyleColorVec4(imgui.ColTabActive, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTabUnfocused, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTabUnfocusedActive, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColPlotLines, imgui.Vec4{X: 0.61, Y: 0.61, Z: 0.61, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColPlotLinesHovered, imgui.Vec4{X: 1.00, Y: 0.43, Z: 0.35, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColPlotHistogram, imgui.Vec4{X: 0.90, Y: 0.70, Z: 0.00, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColPlotHistogramHovered, imgui.Vec4{X: 1.00, Y: 0.60, Z: 0.00, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTextSelectedBg, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.35})
-	imgui.PushStyleColorVec4(imgui.ColDragDropTarget, imgui.Vec4{X: 1.00, Y: 1.00, Z: 0.00, W: 0.90})
-	imgui.PushStyleColorVec4(imgui.ColNavHighlight, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColNavWindowingHighlight, imgui.Vec4{X: 1.00, Y: 1.00, Z: 1.00, W: 0.70})
-	imgui.PushStyleColorVec4(imgui.ColTableHeaderBg, imgui.Vec4{X: 0.12, Y: 0.20, Z: 0.28, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTableBorderStrong, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
-	imgui.PushStyleColorVec4(imgui.ColTableBorderLight, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 0.70})
-
-	return func() {
-		imgui.PopStyleColorV(49)
-		imgui.PopStyleVarV(4)
-	}
-}
-
-func (w *MasterWindow) sizeChange(width, height int) {
-	// noop
-}
-
-func (w *MasterWindow) beforeRender() {
-	Context.invalidAllState()
-	Context.FontAtlas.rebuildFontAtlas()
-
-	// process texture load requests
-	if Context.textureLoadingQueue != nil && Context.textureLoadingQueue.Length() > 0 {
-		for Context.textureLoadingQueue.Length() > 0 {
-			request, ok := Context.textureLoadingQueue.Remove().(textureLoadRequest)
-			Assert(ok, "MasterWindow", "Run", "processing texture requests: wrong type of texture request")
-			NewTextureFromRgba(request.img, request.cb)
-		}
-	}
-}
-
-func (w *MasterWindow) afterRender() {
-	Context.cleanState()
-}
-
-func (w *MasterWindow) beforeDestroy() {
-	imgui.PlotDestroyContext()
-	// imgui.ImNodesDestroyContext() // TODO: after adding ImNodes (https://github.com/AllenDang/cimgui-go/issues/137)
-}
-
-func (w *MasterWindow) render() {
-	fin := w.setTheme()
-	defer fin()
-
-	mainStylesheet := Style()
-	if s, found := Context.cssStylesheet["main"]; found {
-		mainStylesheet = s
-	}
-
-	mainStylesheet.Push()
-	w.updateFunc()
-	mainStylesheet.Pop()
-}
-
-// Run runs the main loop.
-// loopFunc will be used to construct the ui.
-// Run should be called at the end of main function, after setting
-// up the master window.
-func (w *MasterWindow) Run(loopFunc func()) {
-	mainthreadCallPlatform(func() {
-		Context.isRunning = true
-		w.updateFunc = loopFunc
-
-		Context.m.Lock()
-		Context.isAlive = true
-		Context.m.Unlock()
-
-		Context.backend.Run(w.render)
-
-		Context.m.Lock()
-		Context.isAlive = false
-
-		Context.isRunning = false
-		Context.m.Unlock()
-	})
-}
-
-// GetSize return size of master window.
-func (w *MasterWindow) GetSize() (width, height int) {
-	if w.backend != nil {
-		w, h := w.backend.DisplaySize()
-		return int(w), int(h)
-	}
-
-	return w.width, w.height
+	style.SetColor(imgui.StyleColorText, imgui.Vec4{X: 0.95, Y: 0.96, Z: 0.98, W: 1.00})
+	style.SetColor(imgui.StyleColorTextDisabled, imgui.Vec4{X: 0.36, Y: 0.42, Z: 0.47, W: 1.00})
+	style.SetColor(imgui.StyleColorWindowBg, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
+	style.SetColor(imgui.StyleColorChildBg, imgui.Vec4{X: 0.15, Y: 0.18, Z: 0.22, W: 1.00})
+	style.SetColor(imgui.StyleColorPopupBg, imgui.Vec4{X: 0.08, Y: 0.08, Z: 0.08, W: 0.94})
+	style.SetColor(imgui.StyleColorBorder, imgui.Vec4{X: 0.08, Y: 0.10, Z: 0.12, W: 1.00})
+	style.SetColor(imgui.StyleColorBorderShadow, imgui.Vec4{X: 0.00, Y: 0.00, Z: 0.00, W: 0.00})
+	style.SetColor(imgui.StyleColorFrameBg, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
+	style.SetColor(imgui.StyleColorFrameBgHovered, imgui.Vec4{X: 0.12, Y: 0.20, Z: 0.28, W: 1.00})
+	style.SetColor(imgui.StyleColorFrameBgActive, imgui.Vec4{X: 0.09, Y: 0.12, Z: 0.14, W: 1.00})
+	style.SetColor(imgui.StyleColorTitleBg, imgui.Vec4{X: 0.09, Y: 0.12, Z: 0.14, W: 0.65})
+	style.SetColor(imgui.StyleColorTitleBgActive, imgui.Vec4{X: 0.08, Y: 0.10, Z: 0.12, W: 1.00})
+	style.SetColor(imgui.StyleColorTitleBgCollapsed, imgui.Vec4{X: 0.00, Y: 0.00, Z: 0.00, W: 0.51})
+	style.SetColor(imgui.StyleColorMenuBarBg, imgui.Vec4{X: 0.15, Y: 0.18, Z: 0.22, W: 1.00})
+	style.SetColor(imgui.StyleColorScrollbarBg, imgui.Vec4{X: 0.02, Y: 0.02, Z: 0.02, W: 0.39})
+	style.SetColor(imgui.StyleColorScrollbarGrab, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
+	style.SetColor(imgui.StyleColorScrollbarGrabHovered, imgui.Vec4{X: 0.18, Y: 0.22, Z: 0.25, W: 1.00})
+	style.SetColor(imgui.StyleColorScrollbarGrabActive, imgui.Vec4{X: 0.09, Y: 0.21, Z: 0.31, W: 1.00})
+	style.SetColor(imgui.StyleColorCheckMark, imgui.Vec4{X: 0.28, Y: 0.56, Z: 1.00, W: 1.00})
+	style.SetColor(imgui.StyleColorSliderGrab, imgui.Vec4{X: 0.28, Y: 0.56, Z: 1.00, W: 1.00})
+	style.SetColor(imgui.StyleColorSliderGrabActive, imgui.Vec4{X: 0.37, Y: 0.61, Z: 1.00, W: 1.00})
+	style.SetColor(imgui.StyleColorButton, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
+	style.SetColor(imgui.StyleColorButtonHovered, imgui.Vec4{X: 0.28, Y: 0.56, Z: 1.00, W: 1.00})
+	style.SetColor(imgui.StyleColorButtonActive, imgui.Vec4{X: 0.06, Y: 0.53, Z: 0.98, W: 1.00})
+	style.SetColor(imgui.StyleColorHeader, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 0.55})
+	style.SetColor(imgui.StyleColorHeaderHovered, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.80})
+	style.SetColor(imgui.StyleColorHeaderActive, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 1.00})
+	style.SetColor(imgui.StyleColorSeparator, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
+	style.SetColor(imgui.StyleColorSeparatorHovered, imgui.Vec4{X: 0.10, Y: 0.40, Z: 0.75, W: 0.78})
+	style.SetColor(imgui.StyleColorSeparatorActive, imgui.Vec4{X: 0.10, Y: 0.40, Z: 0.75, W: 1.00})
+	style.SetColor(imgui.StyleColorResizeGrip, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.25})
+	style.SetColor(imgui.StyleColorResizeGripHovered, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.67})
+	style.SetColor(imgui.StyleColorResizeGripActive, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.95})
+	style.SetColor(imgui.StyleColorTab, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
+	style.SetColor(imgui.StyleColorTabHovered, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.80})
+	style.SetColor(imgui.StyleColorTabActive, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
+	style.SetColor(imgui.StyleColorTabUnfocused, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
+	style.SetColor(imgui.StyleColorTabUnfocusedActive, imgui.Vec4{X: 0.11, Y: 0.15, Z: 0.17, W: 1.00})
+	style.SetColor(imgui.StyleColorPlotLines, imgui.Vec4{X: 0.61, Y: 0.61, Z: 0.61, W: 1.00})
+	style.SetColor(imgui.StyleColorPlotLinesHovered, imgui.Vec4{X: 1.00, Y: 0.43, Z: 0.35, W: 1.00})
+	style.SetColor(imgui.StyleColorPlotHistogram, imgui.Vec4{X: 0.90, Y: 0.70, Z: 0.00, W: 1.00})
+	style.SetColor(imgui.StyleColorPlotHistogramHovered, imgui.Vec4{X: 1.00, Y: 0.60, Z: 0.00, W: 1.00})
+	style.SetColor(imgui.StyleColorTextSelectedBg, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 0.35})
+	style.SetColor(imgui.StyleColorDragDropTarget, imgui.Vec4{X: 1.00, Y: 1.00, Z: 0.00, W: 0.90})
+	style.SetColor(imgui.StyleColorNavHighlight, imgui.Vec4{X: 0.26, Y: 0.59, Z: 0.98, W: 1.00})
+	style.SetColor(imgui.StyleColorNavWindowingHighlight, imgui.Vec4{X: 1.00, Y: 1.00, Z: 1.00, W: 0.70})
+	style.SetColor(imgui.StyleColorTableHeaderBg, imgui.Vec4{X: 0.12, Y: 0.20, Z: 0.28, W: 1.00})
+	style.SetColor(imgui.StyleColorTableBorderStrong, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 1.00})
+	style.SetColor(imgui.StyleColorTableBorderLight, imgui.Vec4{X: 0.20, Y: 0.25, Z: 0.29, W: 0.70})
 }
 
 // SetBgColor sets background color of master window.
@@ -262,37 +171,118 @@ func (w *MasterWindow) SetBgColor(bgColor color.Color) {
 	const mask = 0xffff
 
 	r, g, b, a := bgColor.RGBA()
-	w.clearColor = imgui.Vec4{
-		X: float32(r) / mask,
-		Y: float32(g) / mask,
-		Z: float32(b) / mask,
-		W: float32(a) / mask,
+	w.clearColor = [4]float32{
+		float32(r) / mask,
+		float32(g) / mask,
+		float32(b) / mask,
+		float32(a) / mask,
+	}
+}
+
+func (w *MasterWindow) sizeChange(width, height int) {
+	w.render()
+}
+
+func (w *MasterWindow) render() {
+	if !w.platform.IsVisible() || w.platform.IsMinimized() {
+		return
 	}
 
-	w.backend.SetBgColor(w.clearColor)
+	Context.invalidAllState()
+	defer Context.cleanState()
+
+	Context.FontAtlas.rebuildFontAtlas()
+
+	p := w.platform
+	r := w.renderer
+
+	mainStylesheet := Style()
+	if s, found := Context.cssStylesheet["main"]; found {
+		mainStylesheet = s
+	}
+
+	p.NewFrame()
+	r.PreRender(w.clearColor)
+
+	imgui.NewFrame()
+	mainStylesheet.Push()
+	w.updateFunc()
+	mainStylesheet.Pop()
+	imgui.Render()
+
+	r.Render(p.DisplaySize(), p.FramebufferSize(), imgui.RenderedDrawData())
+	p.PostRender()
+
+	w.postUpdateFunc()
+}
+
+// Run the main loop to create new frame, process events and call update ui func.
+func (w *MasterWindow) run() {
+	p := w.platform
+
+	ticker := time.NewTicker(time.Second / time.Duration(p.GetTPS()))
+	shouldQuit := false
+
+	for !shouldQuit {
+		mainthread.Call(func() {
+			// process texture load requests
+			if Context.textureLoadingQueue != nil && Context.textureLoadingQueue.Length() > 0 {
+				for Context.textureLoadingQueue.Length() > 0 {
+					request, ok := Context.textureLoadingQueue.Remove().(textureLoadRequest)
+					Assert(ok, "MasterWindow", "Run", "processing texture requests: wrong type of texture request")
+					NewTextureFromRgba(request.img, request.cb)
+				}
+			}
+
+			p.ProcessEvents()
+			w.render()
+
+			shouldQuit = p.ShouldStop()
+		})
+
+		<-ticker.C
+	}
+}
+
+// GetSize return size of master window.
+func (w *MasterWindow) GetSize() (width, height int) {
+	if w.platform != nil {
+		if glfwPlatform, ok := w.platform.(*imgui.GLFW); ok {
+			return glfwPlatform.GetWindow().GetSize()
+		}
+	}
+
+	return w.width, w.height
 }
 
 // GetPos return position of master window.
 func (w *MasterWindow) GetPos() (x, y int) {
-	var xResult, yResult int32
-	if w.backend != nil {
-		xResult, yResult = w.backend.GetWindowPos()
+	if w.platform != nil {
+		if glfwPlatform, ok := w.platform.(*imgui.GLFW); ok {
+			x, y = glfwPlatform.GetWindow().GetPos()
+		}
 	}
 
-	return int(xResult), int(yResult)
+	return
 }
 
 // SetPos sets position of master window.
 func (w *MasterWindow) SetPos(x, y int) {
-	if w.backend != nil {
-		w.backend.SetWindowPos(x, y)
+	if w.platform != nil {
+		if glfwPlatform, ok := w.platform.(*imgui.GLFW); ok {
+			glfwPlatform.GetWindow().SetPos(x, y)
+		}
 	}
 }
 
 // SetSize sets size of master window.
 func (w *MasterWindow) SetSize(x, y int) {
-	if w.backend != nil {
-		w.backend.SetWindowSize(x, y)
+	if w.platform != nil {
+		if glfwPlatform, ok := w.platform.(*imgui.GLFW); ok {
+			mainthread.CallNonBlock(func() {
+				glfwPlatform.GetWindow().SetSize(x, y)
+			})
+		}
 	}
 }
 
@@ -306,14 +296,43 @@ func (w *MasterWindow) SetSize(x, y int) {
 // Mac OS X: Selecting Quit from the application menu will trigger the close
 // callback for all windows.
 func (w *MasterWindow) SetCloseCallback(cb func() bool) {
-	w.backend.SetCloseCallback(func(b imgui.Backend[imgui.GLFWWindowFlags]) {
-		b.SetShouldClose(cb())
-	})
+	w.platform.SetCloseCallback(cb)
 }
 
 // SetDropCallback sets callback when file was dropped into the window.
 func (w *MasterWindow) SetDropCallback(cb func([]string)) {
-	w.backend.SetDropCallback(cb)
+	w.platform.SetDropCallback(cb)
+}
+
+// Run runs the main loop.
+// loopFunc will be used to construct the ui.
+// Run should be called at the end of main function, after setting
+// up the master window.
+func (w *MasterWindow) Run(loopFunc func(), postFunc func()) {
+	mainthread.Run(func() {
+		Context.isRunning = true
+		w.updateFunc = loopFunc
+		w.postUpdateFunc = postFunc
+
+		Context.isAlive = true
+
+		w.run()
+
+		Context.m.Lock()
+		Context.isAlive = false
+		Context.m.Unlock()
+
+		mainthread.Call(func() {
+			w.renderer.Dispose()
+			w.platform.Dispose()
+
+			imgui.ImNodesDestroyContext()
+			imgui.ImPlotDestroyContext()
+			w.context.Destroy()
+		})
+
+		Context.isRunning = false
+	})
 }
 
 // RegisterKeyboardShortcuts registers a global - master window - keyboard shortcuts.
@@ -342,8 +361,8 @@ func (w *MasterWindow) RegisterKeyboardShortcuts(s ...WindowShortcut) *MasterWin
 //
 // The desired image sizes varies depending on platform and system settings. The selected
 // images will be rescaled as needed. Good sizes include 16x16, 32x32 and 48x48.
-func (w *MasterWindow) SetIcon(icons ...image.Image) {
-	w.backend.SetIcons(icons...)
+func (w *MasterWindow) SetIcon(icons []image.Image) {
+	w.platform.SetIcon(icons)
 }
 
 // SetSizeLimits sets the size limits of the client area of the specified window.
@@ -353,12 +372,12 @@ func (w *MasterWindow) SetIcon(icons ...image.Image) {
 // To specify only a minimum size or only a maximum one, set the other pair to giu.DontCare.
 // To disable size limits for a window, set them all to giu.DontCare.
 func (w *MasterWindow) SetSizeLimits(minw, minh, maxw, maxh int) {
-	w.backend.SetWindowSizeLimits(minw, minh, maxw, maxh)
+	w.platform.SetSizeLimits(minw, minh, maxw, maxh)
 }
 
 // SetTitle updates master window's title.
 func (w *MasterWindow) SetTitle(title string) {
-	w.backend.SetWindowTitle(title)
+	w.platform.SetTitle(title)
 }
 
 // Close will safely close the master window.
@@ -368,7 +387,7 @@ func (w *MasterWindow) Close() {
 
 // SetShouldClose sets whether master window should be closed.
 func (w *MasterWindow) SetShouldClose(v bool) {
-	w.backend.SetShouldClose(v)
+	w.platform.SetShouldStop(v)
 }
 
 // SetInputHandler allows to change default input handler.
@@ -376,8 +395,8 @@ func (w *MasterWindow) SetShouldClose(v bool) {
 func (w *MasterWindow) SetInputHandler(handler InputHandler) {
 	Context.InputHandler = handler
 
-	w.backend.SetKeyCallback(func(key, scanCode, action, modifier int) {
-		k, m, a := keyFromGLFWKey(imgui.GLFWKey(key)), Modifier(modifier), Action(action)
+	w.platform.SetInputCallback(func(key glfw.Key, modifier glfw.ModifierKey, action glfw.Action) {
+		k, m, a := Key(key), Modifier(modifier), Action(action)
 		handler.Handle(k, m, a)
 		if w.additionalInputCallback != nil {
 			w.additionalInputCallback(k, m, a)
