@@ -44,6 +44,7 @@ type MasterWindow struct {
 	context    *imgui.Context
 	io         *imgui.IO
 	updateFunc func()
+	postUpdateFunc func()
 
 	// possibility to expend InputHandler's stuff
 	// See SetAdditionalInputHandler
@@ -211,6 +212,8 @@ func (w *MasterWindow) render() {
 
 	r.Render(p.DisplaySize(), p.FramebufferSize(), imgui.RenderedDrawData())
 	p.PostRender()
+
+	w.postUpdateFunc()
 }
 
 // Run the main loop to create new frame, process events and call update ui func.
@@ -305,10 +308,11 @@ func (w *MasterWindow) SetDropCallback(cb func([]string)) {
 // loopFunc will be used to construct the ui.
 // Run should be called at the end of main function, after setting
 // up the master window.
-func (w *MasterWindow) Run(loopFunc func()) {
+func (w *MasterWindow) Run(loopFunc func(), postFunc func()) {
 	mainthread.Run(func() {
 		Context.isRunning = true
 		w.updateFunc = loopFunc
+		w.postUpdateFunc = postFunc
 
 		Context.isAlive = true
 
